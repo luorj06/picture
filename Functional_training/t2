@@ -1,0 +1,466 @@
+WITH tmp_dis_pkg_recomd_box AS(
+    SELECT 
+        bill_id,
+        pkg_id,
+        MAX(recomd_box_id) AS recomd_box_id,
+        MAX(real_box_id) AS real_box_id,
+        MAX(real_box_type) AS real_box_type,
+        MAX(pkg_volume) AS pkg_volume
+    FROM (
+        SELECT
+            a.bill_id,
+            a.pkg_id,
+            b.recomd_box_id,
+            cast(b.real_box_id AS string) AS real_box_id,
+            b.type AS real_box_type,
+            b.goods_volume AS pkg_volume
+        FROM tmp_dis_pkg_bill a
+        LEFT JOIN dw.dwd_dis_wms_recomd_box_df b ON a.pkg_id = b.bill_id AND b.date = 20210309
+        WHERE a.rnk = 1
+        UNION ALL
+        SELECT
+            a.bill_id,
+            a.pkg_id,
+            b.recomd_box_id,
+            cast(b.real_box_id AS string) AS real_box_id,
+            b.type AS real_box_type,
+            b.goods_volume AS pkg_volume
+        FROM tmp_dis_pkg_bill a
+        LEFT JOIN dw.dwd_dis_wms_recomd_box_df b ON a.bill_id = b.bill_id AND b.date = 20210309
+        WHERE a.rnk = 1
+        ) a
+    GROUP BY 
+        a.bill_id,
+        a.pkg_id
+),
+tmp_dis_pkg_pallet AS (
+    SELECT
+        t.pkg_id,
+        max(t.sequence) AS pallet_cnt,
+        sum(size(split(t.box_ids, ','))) AS box_cnt,
+        sum(t.weight) AS pallet_weight,
+        concat_ws(',',collect_list(concat_ws('*',s.length,s.width,s.height))) AS pallet_size,
+        sum(case when t.size is null then 0 else (s.length*s.width*s.height/1000000) end) AS pallet_volume,
+        concat_ws(',', collect_list(case when t.type=1 then 'plastic' when t.type=2 then 'plywood' when t.type=3 then 'wood' when t.type=4 then 'paper' else 'unknown' end)) AS pallet_type
+    FROM dw.dwd_dis_pkg_pallet_df t
+    lateral view json_tuple(t.size,'length','width','height') s AS length,width,height
+    WHERE date = 20210309 
+    GROUP BY t.pkg_id
+),
+tmp_dis_pkg_item AS (
+    SELECT
+        b.bill_id AS waybill_id,
+        a.pkg_id,
+        a.create_tm AS pkg_create_tm,
+        unix_timestamp(a.create_tm) AS pkg_create_ts,
+        a.pkg_type,
+        a.pkg_status,
+        a.weight AS pkg_weight,
+        a.transport_type AS pkg_transport_type,
+        a.waybill_cnt,
+        a.wave_tm,
+        unix_timestamp(a.wave_tm) AS wave_ts,
+        if(c.key_name = 'volumn_type',data, '') AS pkg_volume_type,
+        if(c.key_name = 'last_signed_time',data, '') AS last_signed_tm,
+        if(c.key_name = 'last_signed_time',unix_timestamp(data), -1) AS last_signed_ts,
+        b.recomd_box_id,
+        b.real_box_id,
+        b.real_box_type,
+        b.pkg_volume,
+        d.pallet_cnt,
+        d.box_cnt,
+        d.pallet_weight,
+        d.pallet_size,
+        d.pallet_volume,
+        d.pallet_type
+    FROM dw.dwd_dis_pkg_df a 
+    LEFT JOIN tmp_dis_pkg_recomd_box b ON a.pkg_id = b.pkg_id
+    LEFT JOIN dw.dwd_dis_pkg_extend_df c ON a.pkg_id = c.pkg_id AND c.date = 20210309 AND key_name IN ('volumn_type','last_signed_time')
+    LEFT JOIN tmp_dis_pkg_pallet d ON a.pkg_id = d.pkg_id
+    WHERE a.date = 20210309
+),
+tmp_dis_waybill_extend AS (
+    SELECT 
+        waybill_id,
+        if(key_name = 'stockout_poll_time',1,0) AS stockout_flg,
+        if(key_name = 'stockover_poll_time',1, 0) AS oversell_flg,
+        if(key_name = 'split_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'),'') AS split_tm,
+        if(key_name = 'split_time',data, -1) AS split_ts,
+        if(key_name = 'stockover_poll_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'), '') AS oversell_tm,
+        if(key_name = 'stockover_poll_time',data, -1) AS oversell_ts,
+        if(key_name = 'stockover_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'), '') AS exit_oversell_tm,
+        if(key_name = 'stockover_time',data, -1) AS exit_oversell_ts,
+        if(key_name = 'stockout_poll_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'), '') AS shortage_tm,
+        if(key_name = 'stockout_poll_time',data, -1) AS shortage_ts,
+        if(key_name = 'stockout_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'),'') AS exit_shortage_tm,
+        if(key_name = 'stockout_time',data, -1) AS exit_shortage_ts,
+        if(key_name = 'assign_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'),'') AS ASsign_tm,
+        if(key_name = 'assign_time',data, -1) AS ASsign_ts,
+        if(key_name = 'assign_wait_confirm_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'), '') AS ASsign_wait_confirm_tm,
+        if(key_name = 'assign_wait_confirm_time',data, -1) AS ASsign_wait_confirm_ts,
+        if(key_name = 'express_time',from_unixtime(data,'yyyy-MM-dd HH:mm:ss'),'') AS allot_exp_tm,
+        if(key_name = 'express_time',data, -1) AS allot_exp_ts,
+        if(group_name = 'xm_waybill' and key_name = 'first_try_send_time', data, '') AS first_try_send_tm,
+        if(group_name = 'xm_waybill' and key_name = 'first_try_send_time', unix_timestamp(data), -1) AS first_try_send_ts,
+        if(group_name = 'express_type' and key_name=1, 1, 0) AS self_pick_initial,
+        if(group_name = 'express_type' and (key_name=2 or key_name=1), 1, 0) AS self_pick_actual,
+        if(group_name = 'express_self_get' and key_name=20, add_tm, '') AS cargo_terminal_tm,
+        if(group_name = 'express_self_get' and key_name=20, unix_timestamp(add_tm), -1) AS cargo_terminal_ts,
+        if(group_name = 'xm_waybill' and key_name = 'distance', data, '') AS distance
+    FROM (
+        SELECT
+            waybill_id,
+            MAX(key_name) AS key_name,
+            MAX(group_name) AS group_name,
+            MAX(add_tm) AS add_tm,
+            MAX(data) AS data
+        FROM dw.dwd_dis_waybill_extend_df
+        WHERE 
+            date = 20210309 
+            AND key_name IN ('stockout_poll_time', 'stockover_poll_time', 'split_time', 'stockover_time', 'stockout_time', 'assign_time', 'assign_wait_confirm_time', 'express_time')
+            AND group_name='xm_waybill'
+        GROUP BY waybill_id
+        )
+),
+tmp_dis_wms_waybill_extend AS (
+    SELECT
+        waybill_id,
+        MAX(key_name) AS key_name,
+        MAX(group_name) AS group_name,
+        MAX(add_tm) AS add_tm,
+        MAX(data) AS data
+    FROM dw.dwd_dis_wms_waybill_extend_df
+    WHERE 
+        date = 20210309 
+        AND key_name IN (1, 2, 20, 'first_try_send_time', 'distance', 'business_type')
+        AND group_name IN ('xm_waybill', 'express_type', 'express_self_get')
+    GROUP BY waybill_id
+),
+tmp_mihome_holiday AS(
+    SELECT
+        a.mihome,
+        a.country_id,
+        b.holiday_d,
+        b.holiday,
+        b.zone
+    FROM dw.dim_mihome_df a
+    JOIN (
+        SELECT
+            place_id AS country_id,
+            holiday AS holiday_d,
+            unix_timestamp(holiday, 'yyyy/MM/dd') AS holiday,
+            cast(zone AS bigint) AS zone
+        FROM dw.dim_holiday_global_df
+        WHERE place_type = "country"
+    )b ON a.country_id = b.country_id
+    WHERE ((a.country_code2 <> '' AND a.country_code2 <> 'cn') 
+        OR a.mihome in (419,1929,1087,2035,2494,4662,6976,12221,12220,12206,12205,12203,12201,13684,9738,26672,27380,6594,30917,30902,33484,30012,14113,613))
+),
+tmp_country_province_holiday AS(
+    SELECT
+        c.country_id,
+        c.province_id,
+        b.holiday,
+        b.zone
+    FROM dw.dim_area_df c
+    JOIN (
+        SELECT
+            place_id AS country_id,
+            unix_timestamp(holiday, 'yyyy/MM/dd') AS holiday,
+            cast(zone AS bigint) AS zone
+        FROM dw.dim_holiday_global_df
+        WHERE place_type = "country"
+    )b ON c.country_id = b.country_id
+    WHERE c.area_level = 1
+    UNION ALL
+    SELECT
+        d.country_id,
+        d.province_id,
+        b.holiday,
+        b.zone
+    FROM dw.dim_area_df d
+    JOIN (
+        SELECT
+            place_id AS province_id,
+            unix_timestamp(holiday, 'yyyy/MM/dd') AS holiday,
+            cast(zone AS bigint) AS zone
+        FROM dw.dim_holiday_global_df
+        WHERE place_type = "province"
+    )b ON d.province_id = b.province_id
+    WHERE d.area_level = 2
+),
+tmp_diff_holidays AS(
+    SELECT
+        waybill_id,
+        SUM(enter_ready_diff_holidays) AS enter_ready_diff_holidays,
+        SUM(ready_out_diff_holidays) AS ready_out_diff_holidays,
+        SUM(enter_allot_diff_holidays) AS enter_allot_diff_holidays,
+        MAX(is_enter_holiday) AS is_enter_holiday,
+        SUM(out_signed_diff_holidays) AS out_signed_diff_holidays,
+        SUM(out_first_try_send_diff_holidays) AS out_first_try_send_diff_holidays,
+        MAX(is_signed_holiday) AS is_signed_holiday
+    FROM(
+        SELECT 
+            t1.waybill_id,
+            sum(case when mh.holiday <= t1.signed_ts+mh.zone*3600 and mh.holiday > t1.wms_create_ts+mh.zone*3600 then 1 else 0 end) AS enter_ready_diff_holidays,
+            sum(case when mh.holiday <= t1.out_ts+mh.zone*3600 and mh.holiday > t1.signed_ts+mh.zone*3600 then 1 else 0 end) AS ready_out_diff_holidays,
+            sum(case when mh.holiday <= t2.allot_ts+mh.zone*3600 and mh.holiday > t1.wms_create_ts+mh.zone*3600 then 1 else 0 end) AS enter_allot_diff_holidays,
+            sum(case when mh.holiday <= t1.out_ts+mh.zone*3600 and mh.holiday > t2.allot_ts+mh.zone*3600 then 1 else 0 end) AS allot_out_diff_holidays,
+            max(case when datediff(from_unixtime(t1.wms_create_ts+mh.zone*3600),from_unixtime(mh.holiday)) = 0 then 1 else 0 end) AS is_enter_holiday,
+            0 AS out_signed_diff_holidays,  
+            0 AS out_first_try_send_diff_holidays,
+            0 AS is_signed_holiday
+        FROM dw.dwd_dis_wmspro_waybill_df t1
+        LEFT JOIN dw.dwd_dis_waybill_extension_df t2 ON t1.waybill_id = t2.waybill_id AND t2.date = 20210309
+        LEFT JOIN tmp_mihome_holiday mh ON t1.mihome = mh.mihome 
+        WHERE t1.date = 20210309
+        GROUP BY t1.waybill_id
+
+        UNION ALL
+
+        SELECT
+            t1.waybill_id,
+            0 AS enter_ready_diff_holidays,
+            0 AS ready_out_diff_holidays,
+            0 AS enter_allot_diff_holidays,
+            0 AS is_enter_holiday,
+            sum(case when cph.holiday < t1.signed_ts+cph.zone*3600 and cph.holiday > t1.out_ts+cph.zone*3600  then 1 else 0 end) AS out_signed_diff_holidays,  
+            sum(case when from_unixtime(cph.holiday) < t3.first_try_send_tm and cph.holiday > t1.out_ts+cph.zone*3600 and t3.first_try_send_tm!='' then 1 else 0 end) AS out_first_try_send_diff_holidays,
+            max(case when datediff(from_unixtime(t1.signed_ts+cph.zone*3600),from_unixtime(cph.holiday)) = 0 then 1 else 0 end) AS is_signed_holiday
+        FROM dw.dwd_dis_wmspro_waybill_df t1
+        LEFT JOIN tmp_dis_waybill_extend t3 ON t1.waybill_id = t3.waybill_id
+        LEFT JOIN tmp_country_province_holiday cph ON t1.country_id = cph.country_id and t1.province_id = cph.province_id
+        WHERE t1.date = 20210309
+        GROUP BY t1.waybill_id
+    )
+    GROUP BY waybill_id
+)
+INSERT OVERWRITE TABLE dw.dwm_dis_wms_waybill_df partition (date = 20210309)
+SELECT 
+    COALESCE(t1.waybill_id, -1) AS waybill_id,
+    COALESCE(t1.ord_id, -1) AS ord_id,
+    COALESCE(t1.pay_id, -1) AS pay_id,
+    COALESCE(t1.exp_id, -1) AS exp_id,
+    COALESCE(t1.exp_sn, '') AS exp_sn,
+    COALESCE(t1.user_id, -1) AS user_id,
+    COALESCE(t1.exp_push_status, -1) AS exp_push_status,
+    COALESCE(t1.sku_weight, 0.0) AS sku_weight,
+    COALESCE(t1.weight, 0.0) AS weight,
+    COALESCE(t1.print_level, -1) AS print_level,
+    COALESCE(t1.waybill_type, -1) AS waybill_type,
+    COALESCE(t1.push_status, -1) AS push_status,
+    COALESCE(t1.wms_name, '') AS wms_name,
+    COALESCE(t1.is_lock, -1) AS is_lock,
+    COALESCE(t1.waybill_status, -1) AS waybill_status,
+    COALESCE(t1.wms_waybill_status, -1) AS wms_waybill_status,
+    COALESCE(t1.wms_status, -1) AS wms_status,
+    COALESCE(t1.stock_status, -1) AS stock_status,
+    COALESCE(t1.stockover_status, -1) AS stockover_status,
+    COALESCE(t1.pkg_flow, -1) AS pkg_flow,
+    COALESCE(t1.product_stock_status, -1) AS product_stock_status,
+    COALESCE(t1.transport_type, -1) AS transport_type,
+    COALESCE(t1.mihome, -1) AS mihome,
+    COALESCE(t7.mihome_name, '') AS mihome_name,
+    COALESCE(t3.mihome_cat, '') AS mihome_cat,
+    COALESCE(t3.mihome_type, '') AS mihome_type,
+    COALESCE(t1.pay_type, '') AS pay_type,
+    COALESCE(t1.curr, '') AS curr,
+    COALESCE(t1.tax_amt, 0.0) AS tax_amt,
+    COALESCE(t1.total_amt, 0.0) AS total_amt,
+    COALESCE(t1.discount_amt, 0.0) AS discount_amt,
+    COALESCE(t1.exp_amt, 0.0) AS exp_amt,
+    COALESCE(t1.ins_amt, 0.0) AS ins_amt,
+    COALESCE(t1.country_code3, '') AS country_code3,
+    COALESCE(t1.country_id, -1) AS country_id,
+    COALESCE(t1.province_id, -1) AS province_id,
+    COALESCE(t1.city_id, -1) AS city_id,
+    COALESCE(t1.district_id, -1) AS district_id,
+    COALESCE(t1.area_id, -1) AS area_id,
+    COALESCE(t1.consignee_idx, '') AS consignee_idx,
+    COALESCE(t1.tel_idx, '') AS tel_idx,
+    COALESCE(t1.ord_tm, '') AS ord_tm,
+    COALESCE(t1.ord_ts, -1) AS ord_ts,
+    COALESCE(t1.pay_tm, '') AS pay_tm,
+    COALESCE(t1.pay_ts, -1) AS pay_ts,
+    COALESCE(t1.wms_acc_tm, '') AS wms_acc_tm,
+    COALESCE(t1.wms_acc_ts, -1) AS wms_acc_ts,
+    COALESCE(t1.create_tm, '') AS create_tm,
+    COALESCE(t1.create_ts, -1) AS create_ts,
+    COALESCE(t1.wms_create_tm, '') AS wms_create_tm,
+    COALESCE(t1.wms_create_ts, -1) AS wms_create_ts,
+    COALESCE(t1.update_tm, '') AS update_tm,
+    COALESCE(t1.update_ts, -1) AS update_ts,
+    COALESCE(t1.out_tm, '') AS out_tm,
+    COALESCE(t1.out_ts, -1) AS out_ts,
+    COALESCE(t1.signed_tm, '') AS signed_tm,
+    COALESCE(t1.signed_ts, -1) AS signed_ts,
+    COALESCE(t1.wms_signed_tm, '') AS wms_signed_tm,
+    COALESCE(t1.wms_signed_ts, -1) AS wms_signed_ts,
+    COALESCE(t1.rcv_signed_tm, '') AS rcv_signed_tm,
+    COALESCE(t1.rcv_signed_ts, -1) AS rcv_signed_ts,
+    COALESCE(t1.complete_tm, '') AS complete_tm,
+    COALESCE(t1.complete_ts, -1) AS complete_ts,
+    COALESCE(t1.max_exp_tm, '') AS max_exp_tm,
+    COALESCE(t1.max_exp_ts, -1) AS max_exp_ts,
+    COALESCE(t1.push_tm, '') AS push_tm,
+    COALESCE(t1.push_ts, -1) AS push_ts,
+    COALESCE(t8.cancel_exp_tm, '') AS cancel_exp_tm,
+    COALESCE(t8.cancel_exp_ts, -1) AS cancel_exp_ts,
+    COALESCE(t8.merge_tm, '') AS merge_tm,
+    COALESCE(t8.merge_ts, -1) AS merge_ts,
+    COALESCE(t8.print_tm, '') AS print_tm,
+    COALESCE(t8.print_ts, -1) AS print_ts,
+    COALESCE(t8.pick_tm, '') AS pick_tm,
+    COALESCE(t8.pick_ts, -1) AS pick_ts,
+    COALESCE(t8.allot_tm, '') AS allot_tm,
+    COALESCE(t8.allot_ts, -1) AS allot_ts,
+    COALESCE(t8.ready_tm, '') AS ready_tm,
+    COALESCE(t8.ready_ts, -1) AS ready_ts,
+    COALESCE(t8.reject_tm, '') AS reject_tm,
+    COALESCE(t8.reject_ts, -1) AS reject_ts,
+    COALESCE(t8.return_tm, '') AS return_tm,
+    COALESCE(t8.return_ts, -1) AS return_ts,
+    COALESCE(t8.lost_tm, '') AS lost_tm,
+    COALESCE(t8.lost_ts, -1) AS lost_ts,
+    COALESCE(t9.stockout_flg, 0) AS stockout_flg,
+    COALESCE(t9.oversell_flg, 1) AS oversell_flg,
+    COALESCE(t9.split_tm, '') AS split_tm,
+    COALESCE(t9.split_ts, -1) AS split_ts,
+    COALESCE(t9.oversell_tm, '') AS oversell_tm,
+    COALESCE(t9.oversell_ts, -1) AS oversell_ts,
+    COALESCE(t9.exit_oversell_tm, '') AS exit_oversell_tm,
+    COALESCE(t9.exit_oversell_ts, -1) AS exit_oversell_ts,
+    COALESCE(t9.shortage_tm, '') AS shortage_tm,
+    COALESCE(t9.shortage_ts, -1) AS shortage_ts,
+    COALESCE(t9.exit_shortage_tm, '') AS exit_shortage_tm,
+    COALESCE(t9.exit_shortage_ts, -1) AS exit_shortage_ts,
+    COALESCE(t9.assign_tm, '') AS assign_tm,
+    COALESCE(t9.assign_ts, -1) AS assign_ts,
+    COALESCE(t9.assign_wait_confirm_tm, '') AS assign_wait_confirm_tm,
+    COALESCE(t9.assign_wait_confirm_ts, -1) AS assign_wait_confirm_ts,
+    COALESCE(t9.allot_exp_tm, '') AS allot_exp_tm,
+    COALESCE(t9.allot_exp_ts, -1) AS allot_exp_ts,
+    COALESCE(t9.first_try_send_tm, '') AS first_try_send_tm,
+    COALESCE(t9.first_try_send_ts, -1) AS first_try_send_ts,
+    COALESCE(t9.self_pick_initial, '') AS self_pick_initial,
+    COALESCE(t9.self_pick_actual, -1) AS self_pick_actual,
+    COALESCE(t9.cargo_terminal_tm, '') AS cargo_terminal_tm,
+    COALESCE(t9.cargo_terminal_ts, -1) AS cargo_terminal_ts,
+    COALESCE(t9.distance, '') AS distance,
+    COALESCE(t11.pkg_id, '') AS pkg_id,
+    COALESCE(t11.pkg_create_tm, '') AS pkg_create_tm,
+    COALESCE(t11.pkg_create_ts, -1) AS pkg_create_ts,
+    COALESCE(t11.pkg_type, -1) AS pkg_type,
+    COALESCE(t11.pkg_status, -1) AS pkg_status,
+    COALESCE(t11.pkg_weight, 0.0) AS pkg_weight,
+    COALESCE(t11.pkg_transport_type, -1) AS pkg_transport_type,
+    COALESCE(t11.waybill_cnt, -1) AS waybill_cnt,
+    COALESCE(t11.wave_tm, '') AS wave_tm,
+    COALESCE(t11.wave_ts, -1) AS wave_ts,
+    COALESCE(t11.pkg_volume_type, '') AS pkg_volume_type,
+    COALESCE(t11.last_signed_tm, '') AS last_signed_tm,
+    COALESCE(t11.last_signed_ts, -1) AS last_signed_ts,
+    COALESCE(t11.recomd_box_id, -1) AS recomd_box_id,
+    COALESCE(t11.real_box_id, '') AS real_box_id,
+    COALESCE(t11.real_box_type, -1) AS real_box_type,
+    COALESCE(t11.pkg_volume, 0.0) AS pkg_volume,
+    COALESCE(t11.pallet_cnt, 0) AS pallet_cnt,
+    COALESCE(t11.box_cnt, 0) AS box_cnt,
+    COALESCE(t11.pallet_weight, 0.0) AS pallet_weight,
+    COALESCE(t11.pallet_size, '') AS pallet_size,
+    COALESCE(t11.pallet_volume, 0.0) AS pallet_volume,
+    COALESCE(t11.pallet_type, '') AS pallet_type,
+    COALESCE(t2.sale_channel_1, -1) AS sale_channel_1,
+    COALESCE(t2.sale_channel_2, -1) AS sale_channel_2,
+    COALESCE(t2.sale_channel_3, -1) AS sale_channel_3,
+    COALESCE(t2.sale_channel_4, -1) AS sale_channel_4,
+    COALESCE(t2.sale_channel_5, -1) AS sale_channel_5,
+    COALESCE(t2.sale_channel_name_1, '') AS sale_channel_name_1,
+    COALESCE(t2.sale_channel_name_2, '') AS sale_channel_name_2,
+    COALESCE(t2.sale_channel_name_3, '') AS sale_channel_name_3,
+    COALESCE(t2.sale_channel_name_4, '') AS sale_channel_name_4,
+    COALESCE(t2.sale_channel_name_5, '') AS sale_channel_name_5,
+    COALESCE(t2.sap_cus_name, '') AS sap_cus_name,
+    COALESCE(t2.sap_cus_code, '') AS sap_cus_code,
+    COALESCE(t2.sap_account_name, '') AS sap_account_name,
+    COALESCE(t2.sap_account_id, -1) AS sap_account_id,
+    COALESCE(t2.country_code2, '') AS country_code2,
+    COALESCE(t2.ord_type, '') AS ord_type,
+    COALESCE(t2.sale_type, -1) AS sale_type,
+    COALESCE(t2.ord_from, -1) AS ord_from,
+    COALESCE(t4.exp_name, '') AS exp_name,
+    COALESCE(t4.exp_co_id, '') AS exp_co_id,
+    COALESCE(t5.exp_co_name, '') AS exp_co_name,
+    COALESCE(t10.data, '') AS business_type,
+    case 
+        when t1.wms_signed_tm!='' then (unix_timestamp(t1.wms_signed_tm)-unix_timestamp(t1.wms_create_tm))/3600
+        else -1 end AS enter_signed_diff_hours,
+    case 
+        when t1.wms_signed_tm!='' then datediff(t1.wms_signed_tm, t1.wms_create_tm)
+        else -1 end AS enter_signed_diff_days,
+    case 
+        when t1.wms_signed_tm!='' then (unix_timestamp(t1.wms_signed_tm)-unix_timestamp(t1.out_tm))/3600
+        else -1 end AS out_signed_diff_hours,
+    COALESCE(t6.enter_ready_diff_holidays, 0) AS enter_ready_diff_holidays,
+    COALESCE(t6.ready_out_diff_holidays, 0) AS ready_out_diff_holidays,
+    COALESCE(t6.enter_allot_diff_holidays, 0) AS enter_allot_diff_holidays,
+    COALESCE(t6.allot_out_diff_holidays, 0) AS allot_out_diff_holidays,
+    COALESCE(t6.out_signed_diff_holidays, 0) AS out_signed_diff_holidays,
+    COALESCE(t6.out_first_try_send_diff_holidays, 0) AS out_first_try_send_diff_holidays,
+    COALESCE(t6.is_signed_holiday, 0) AS is_signed_holiday,
+    COALESCE(t6.is_enter_holiday, 0) AS is_enter_holiday,
+    if((t1.print_level = 1 
+            and t1.mihome in (28105,112,2056,14189,420,26695,348,359,563,363,28100,9708,27165,416,432,4743,14180,708,719,1870,6883,463,455,454,14187,14179,14185,505,1906,14183)
+            and t1.city_id in (36,235,108,205,72,272,109,233,187,325,151,171,122,268,159,219,293,95,86,302,170,133,335,362,254,60)) 
+            or (t1.print_level in (8, 9, 10)), 1, 0) AS enter_211_flg,
+    if(((t1.print_level = 1 
+        and t1.mihome in (28105,112,2056,14189,420,26695,348,359,563,363,28100,9708,27165,416,432,4743,14180,708,719,1870,6883,463,455,454,14187,14179,14185,505,1906,14183)
+        and t1.city_id in (36,235,108,205,72,272,109,233,187,325,151,171,122,268,159,219,293,95,86,302,170,133,335,362,254,60))
+        or (t1.print_level in (8, 9, 10)))
+    and t1.wms_signed_tm !=''
+    and (-- 苏州10点，兰州10点
+        (((t1.city_id = 113) or (t1.city_id = 335))
+        and (-- 23-10点进单，当日24点前妥投
+            (hour(t1.wms_create_tm) = 23 and unix_timestamp(t1.wms_signed_tm, 'yyyy-MM-dd HH:mm:ss') < unix_timestamp(date_add(date(t1.wms_create_tm),2)))
+            or (hour(t1.wms_create_tm) >= 0 and hour(t1.wms_create_tm) < 10 and
+            date(t1.wms_signed_tm) = date(t1.wms_create_tm))
+            or (hour(t1.wms_create_tm) >= 10 and hour(t1.wms_create_tm) < 23 and
+            unix_timestamp(t1.wms_signed_tm, 'yyyy-MM-dd HH:mm:ss') <= unix_timestamp(date_add(date(t1.wms_create_tm),1)) + 54000)))
+    or-- 乌鲁木齐12，24
+        ((t1.city_id = 362)
+        and (-- 0-12点进单，当日24点前妥投
+        (hour(t1.wms_create_tm) >= 0 and hour(t1.wms_create_tm) < 12 and
+        date(t1.wms_signed_tm) = date(t1.wms_create_tm))
+        or (hour(t1.wms_create_tm) >= 12 and
+        unix_timestamp(t1.wms_signed_tm, 'yyyy-MM-dd HH:mm:ss') <= unix_timestamp(date_add(date(t1.wms_create_tm),1)) + 57600)))
+    or (t1.city_id not in (113,335,362)
+        and (hour(t1.wms_create_tm) = 23 and unix_timestamp(t1.wms_signed_tm, 'yyyy-MM-dd HH:mm:ss') <= unix_timestamp(date_add(date(t1.wms_create_tm),2)))
+        or (hour(t1.wms_create_tm) >= 0 and hour(t1.wms_create_tm) < 11 and
+        date(t1.wms_signed_tm) = date(t1.wms_create_tm))
+        or (hour(t1.wms_create_tm) >= 11 and hour(t1.wms_create_tm) < 23 and
+        unix_timestamp(t1.wms_signed_tm, 'yyyy-MM-dd HH:mm:ss') < unix_timestamp(date_add(date(t1.wms_create_tm),1)) + 54000))), 1, 0) AS signed_211_flg,
+    if(t11.pkg_status=61 and
+        t1.transport_type <> 0 and
+        t2.ord_from in (11,35,9,41) and
+        t2.sale_type <> 4  and
+        t2.sale_channel_2 in (12,73,54,277,59,60,57,56,294,159,86,29,308,36,207,208,161,65,301,87,92,70,135), 1, 0) AS dis_toB_signed_flg,
+    if(t2.sale_channel_3 in (38,271,358,11,37,40,41,42,44,45,46,47,50,51,299,313,383,14,302,88,158,276), 1, 0) AS dis_medium_channel_flg,
+    if(t1.mihome in (30752,30741,682,5653,5038,4898,26548,24929,29047,5399,34798,26366,7726,28552,28551,30765,5056,24887,24898,24388,8935,504,4899,29247,5053,26359,5376,
+    5658,4892,24901,5054,29751,30742,2216,29345,370,30726,6606,14232,6034,36098,30754,467,5401,4900,24401,24936,28528,24392,3699,1931,473,4903,5051,6543
+  ) and t2.sale_channel_2 in (12,36,157), 1, 0) AS dis_appliances_flg,
+    if(t1.wms_name in('XMS','UPS','BACKEND','N','CAINIAO','STORE','MJYPTH3','PINGTAI'), 0, 1) AS dis_valid_flg,
+    COALESCE(t1.source, '') AS source,
+    from_unixtime(unix_timestamp(),'yyyy-MM-dd HH:mm:ss') etl_tm
+FROM dw.dwd_dis_wmspro_waybill_df t1
+LEFT JOIN dw.dwm_ord_ord_df t2 ON t1.ord_id = t2.ord_id AND t2.date = 20210309
+LEFT JOIN dw.dim_inv_mihome_region_df t3 ON t1.mihome = t3.mihome
+LEFT JOIN dw.dim_exp_df t4 ON t1.exp_id = t4.exp_id
+LEFT JOIN dw.dim_exp_co_df t5 ON t4.exp_co_id = t5.exp_co_id
+LEFT JOIN tmp_diff_holidays t6 ON t1.waybill_id = t6.waybill_id
+LEFT JOIN dw.dim_mihome_df t7 ON t1.mihome = t7.mihome
+LEFT JOIN dw.dwd_dis_waybill_extension_df t8 ON t1.waybill_id = t8.waybill_id AND t8.date = 20210309
+LEFT JOIN tmp_dis_waybill_extend t9 ON t1.waybill_id = t9.waybill_id
+LEFT JOIN tmp_dis_wms_waybill_extend t10 ON t1.waybill_id = t10.waybill_id
+LEFT JOIN tmp_dis_pkg_item t11 ON t1.waybill_id = t11.waybill_id
+WHERE t1.date = 20210309
+distribute by (ceil(rand()*30))
